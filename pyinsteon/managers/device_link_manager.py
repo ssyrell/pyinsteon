@@ -151,7 +151,7 @@ class DeviceLinkManager:
                         links = _add_controller_link(links, device.address, rec)
                     continue
                 if (not controller or rec.target == controller) and (
-                    not group or rec.group != group
+                    group is None or rec.group == group
                 ):
                     links = _add_responder_link(
                         links, self._devices, device.address, rec
@@ -228,7 +228,10 @@ class DeviceLinkManager:
                 # ALDB record data1 field value. We will then check the actual status later.
                 for data in data_list:
                     if device.cat in [0x01, 0x02] and data.data3 is not None:
-                        device.groups[data.data3].value = data.data1
+                        responder_group = data.data3
+                        if responder_group == 0 and len(device.groups) == 1:
+                            responder_group = next(iter(device.groups))
+                        device.groups[responder_group].value = data.data1
                 if not device.is_battery:
                     response = ResponseStatus.UNSENT
                     retries = 5
