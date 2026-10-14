@@ -518,3 +518,135 @@ async def test_explicit_settings_override_controller_defaults(scene_devices, tmp
     )
     records = active(devices[LIGHT], target=MODEM, group=20, is_controller=False)
     assert [(rec.data1, rec.data2, rec.data3) for rec in records] == [(100, 10, 1)]
+
+
+async def hand_link(devices, controller, group, responder, data1, data2, data3):
+    """Write a hand-made controller/responder link pair."""
+    devices[controller].aldb.add(group=group, target=responder, controller=True)
+    devices[responder].aldb.add(
+        group=group,
+        target=controller,
+        controller=False,
+        data1=data1,
+        data2=data2,
+        data3=data3,
+    )
+    await devices[controller].aldb.async_write()
+    await devices[responder].aldb.async_write()
+
+
+def duplicate_record(device, record, data1):
+    """Insert a second copy of a record with a different level."""
+    records = dict(device.aldb.items())
+    mem_addr = min(records)
+    records[mem_addr] = ALDBRecord(
+        mem_addr,
+        controller=record.is_controller,
+        group=record.group,
+        target=record.target,
+        data1=data1,
+        data2=record.data2,
+        data3=record.data3,
+        in_use=True,
+        high_water_mark=False,
+    )
+    records[mem_addr - 8] = ALDBRecord(
+        mem_addr - 8,
+        controller=False,
+        group=0,
+        target="000000",
+        data1=0,
+        data2=0,
+        data3=0,
+        in_use=False,
+        high_water_mark=True,
+    )
+    device.aldb.load_saved_records(ALDBStatus.LOADED, records)
+
+
+@async_case
+async def test_import_hand_made_scene(scene_devices, tmp_path):
+    """Buttons that control each other import as one scene, adopting their links."""
+    devices = scene_devices()
+    for controller, group in ((KEYPAD, 3), (LIGHT, 1)):
+        await hand_link(devices, controller, group, OTHER, 128, 20, 1)
+    await hand_link(devices, KEYPAD, 3, LIGHT, 200, 10, 1)
+    await hand_link(devices, LIGHT, 1, KEYPAD, 255, 28, 3)
+    await scenes.async_add_or_update_scene(-1, LINKS, "Duplicate", str(tmp_path))
+    other_records = len(devices[OTHER].aldb)
+
+    found = await scenes.async_find_device_scenes(str(tmp_path))
+    assert found == [
+        {
+            "controllers": [
+                {"address": KEYPAD, "group": 3},
+                {"address": LIGHT, "group": 1},
+            ],
+            "links": [
+                {"address": KEYPAD, "data1": 255, "data2": 28, "data3": 3},
+                {"address": LIGHT, "data1": 200, "data2": 10, "data3": 1},
+                {"address": OTHER, "data1": 128, "data2": 20, "data3": 1},
+            ],
+            "issues": [],
+            "importable": True,
+        }
+    ]
+    scene_num, result = await scenes.async_import_device_scene(
+        found[0]["controllers"], "Evening", str(tmp_path)
+    )
+    assert (scene_num, result) == (21, ResponseStatus.SUCCESS)
+
+    assert len(active(devices[OTHER], target=LIGHT, group=1)) == 1
+    assert len(active(devices[LIGHT], target=KEYPAD, group=3)) == 1
+    assert len(active(devices[KEYPAD], target=LIGHT, group=1)) == 1
+    for address in (KEYPAD, LIGHT, OTHER):
+        assert len(active(devices[address], target=MODEM, group=21)) == 1
+    assert len(devices[OTHER].aldb) == other_records + 1
+    scene = await scenes.async_get_scene(21, str(tmp_path))
+    assert scene["name"] == "Evening"
+    assert scene["controllers"] == found[0]["controllers"]
+    assert await scenes.async_find_device_scenes(str(tmp_path)) == []
+
+    assert await scenes.async_delete_scene(20, str(tmp_path)) == ResponseStatus.SUCCESS
+    assert len(active(devices[LIGHT], target=MODEM, group=21)) == 1
+    assert len(active(devices[OTHER], target=KEYPAD, group=3)) == 1
+
+
+@async_case
+async def test_import_splits_buttons_with_different_settings(scene_devices, tmp_path):
+    """Buttons whose shared responders use different levels import separately."""
+    devices = scene_devices()
+    await hand_link(devices, KEYPAD, 4, OTHER, 100, 28, 1)
+    await hand_link(devices, REMOTE, 2, OTHER, 50, 28, 1)
+    await hand_link(devices, REMOTE, 2, KEYPAD, 255, 28, 4)
+    found = await scenes.async_find_device_scenes(str(tmp_path))
+    assert [item["controllers"] for item in found] == [
+        [{"address": KEYPAD, "group": 4}],
+        [{"address": REMOTE, "group": 2}],
+    ]
+    assert all(item["importable"] for item in found)
+
+
+@async_case
+async def test_blocked_device_scene_is_reported_not_imported(scene_devices, tmp_path):
+    """Buttons with conflicting or unreadable links cannot be imported."""
+    devices = scene_devices()
+    await hand_link(devices, KEYPAD, 5, LIGHT, 100, 28, 1)
+    duplicate_record(devices[LIGHT], active(devices[LIGHT], target=KEYPAD)[0], 50)
+    devices[KEYPAD].aldb.add(group=6, target=OTHER, controller=True)
+    await devices[KEYPAD].aldb.async_write()
+    devices[OTHER].aldb._status = ALDBStatus.PARTIAL
+
+    found = await scenes.async_find_device_scenes(str(tmp_path))
+    issues = {item["controllers"][0]["group"]: item["issues"] for item in found}
+    assert issues[5] == ["44.44.44 has conflicting links to this button"]
+    assert issues[6] == [
+        "Read the complete All-Link Database for 55.55.55",
+        "The button has no responders",
+    ]
+    assert not any(item["importable"] for item in found)
+    with pytest.raises(controllers.SceneControllerError, match="conflicting"):
+        await scenes.async_import_device_scene(
+            [{"address": KEYPAD, "group": 5}], "Blocked", str(tmp_path)
+        )
+    assert not active(devices[LIGHT], target=MODEM)

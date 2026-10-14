@@ -174,10 +174,23 @@ def _local_setting(device, name, default):
     return int(prop.value)
 
 
+def _responds(device):
+    return not device.is_battery and device.cat in RESPONDING_CONTROLLER_CATEGORIES
+
+
+def valid_output(device, data3):
+    """Return whether data3 selects an output of the responder."""
+    return (
+        not device.groups
+        or data3 in device.groups
+        or (len(device.groups) == 1 and data3 == 0)
+    )
+
+
 def _controller_link(controller):
     """Return the responder link that keeps a controller button in the scene."""
     device = _device(controller["address"])
-    if device.is_battery or device.cat not in RESPONDING_CONTROLLER_CATEGORIES:
+    if not _responds(device):
         return None
     on_level, ramp_rate = DEFAULT_ON_LEVEL, DEFAULT_RAMP_RATE
     if controller["group"] == 1:
@@ -235,7 +248,7 @@ def _records(scene_num, links, controllers):
     return records
 
 
-def _validate_controllers(scene_num, controllers, previous):
+def _validate_controllers(scene_num, controllers, previous, *, adopt=False):
     try:
         ControllerSchema(controllers)
     except vol.Error as exc:
@@ -284,7 +297,8 @@ def _validate_controllers(scene_num, controllers, previous):
                 raise SceneControllerError(
                     f"{device.address} group {item['group']} belongs to scene {other_num}"
                 )
-        if pair not in previous_pairs:
+        # Imports adopt the hand-made links that were found for these buttons.
+        if pair not in previous_pairs and not adopt:
             if any(
                 rec.target != devices.modem.address
                 for rec in device.aldb.find(
@@ -423,23 +437,25 @@ def _stage(owned, desired):
     return affected
 
 
-async def async_save(scene_num, links, controllers, current_links, work_dir, name):
+async def async_save(
+    scene_num, links, controllers, current_links, work_dir, name, *, adopt=False
+):
     """Journal a desired scene, then write only its owned ALDB records."""
     async with _state_lock:
         return await _async_save_scene(
-            scene_num, links, controllers, current_links, work_dir, name
+            scene_num, links, controllers, current_links, work_dir, name, adopt=adopt
         )
 
 
 async def _async_save_scene(
-    scene_num, links, controllers, current_links, work_dir, name
+    scene_num, links, controllers, current_links, work_dir, name, *, adopt=False
 ):
     if not work_dir:
         raise SceneControllerError(
             "A working directory is required for device-controlled scenes"
         )
     previous = _scenes.get(scene_num, {})
-    controllers = _validate_controllers(scene_num, controllers, previous)
+    controllers = _validate_controllers(scene_num, controllers, previous, adopt=adopt)
     desired = _records(scene_num, links, controllers)
     owned = _records(scene_num, current_links, previous.get("controllers", []))
     owned.update({_key(record): record for record in previous.get("records", [])})
@@ -498,3 +514,129 @@ async def async_delete(scene_num, current_links, work_dir):
             _scenes.pop(scene_num)
             await _async_save(work_dir)
         return result
+
+
+def _managed_pairs():
+    pairs = set()
+    for scene in _scenes.values():
+        pairs.update(
+            (Address(item["address"]).id, item["group"])
+            for item in scene["controllers"]
+        )
+        pairs.update(
+            (record["address"], record["group"])
+            for record in scene["records"]
+            if record["controller"]
+            and Address(record["address"]) != devices.modem.address
+        )
+    return pairs
+
+
+def _scan_buttons():
+    """Collect hand-made links by controller button from loaded databases."""
+    buttons = {}
+
+    def button(address, group):
+        return buttons.setdefault(
+            (Address(address).id, group), {"outputs": {}, "targets": set()}
+        )
+
+    for address in devices:
+        device = devices[address]
+        if device == devices.modem or not device.aldb.is_loaded:
+            continue
+        for rec in device.aldb.find(in_use=True):
+            if rec.group == 0 or rec.target in (devices.modem.address, device.address):
+                continue
+            if rec.is_controller:
+                button(device.address, rec.group)["targets"].add(rec.target.id)
+            else:
+                outputs = button(rec.target, rec.group)["outputs"]
+                outputs.setdefault((device.address.id, rec.data3), set()).add(
+                    (rec.data1, rec.data2)
+                )
+    return buttons
+
+
+def _button_issues(address, group, info):
+    device = devices[address]
+    if device is None:
+        return [f"{Address(address)} is not a known Insteon device"]
+    issues = []
+    if group not in controller_groups(device):
+        issues.append(f"{device.address} group {group} is not a controller button")
+    if not device.aldb.is_loaded:
+        issues.append(f"Read the complete All-Link Database for {device.address}")
+    responders = {output[0] for output in info["outputs"]}
+    for target in sorted(info["targets"] - responders):
+        responder = devices[target]
+        if responder is None or not responder.aldb.is_loaded:
+            issues.append(f"Read the complete All-Link Database for {Address(target)}")
+    for (target, data3), levels in sorted(info["outputs"].items()):
+        if len(levels) > 1:
+            issues.append(f"{Address(target)} has conflicting links to this button")
+        if not valid_output(devices[target], data3):
+            issues.append(f"{Address(target)} has no output {data3}")
+    return issues
+
+
+def _candidate(members, buttons, issues):
+    outputs = {}
+    for member in members:
+        for output, levels in buttons[member]["outputs"].items():
+            outputs.setdefault(output, set()).update(levels)
+    if not issues and any(len(levels) > 1 for levels in outputs.values()):
+        return None
+    links = [
+        {
+            "address": address,
+            "data1": data1,
+            "data2": data2,
+            "data3": data3,
+        }
+        for (address, data3), levels in sorted(outputs.items())
+        for data1, data2 in levels
+    ]
+    if not links:
+        issues = [*issues, "The button has no responders"]
+    return {
+        "controllers": [
+            {"address": address, "group": group} for address, group in sorted(members)
+        ],
+        "links": links,
+        "issues": issues,
+        "importable": not issues,
+    }
+
+
+def find_device_scenes():
+    """Return hand-made device-controlled scenes which can be imported.
+
+    Buttons are grouped when they control the same set of outputs (including each
+    other) with the same settings, as created by Insteon Director.
+    """
+    managed = _managed_pairs()
+    buttons = {
+        pair: info for pair, info in _scan_buttons().items() if pair not in managed
+    }
+    candidates = []
+    groups = {}
+    for (address, group), info in sorted(buttons.items()):
+        issues = _button_issues(address, group, info)
+        if issues:
+            candidates.append(_candidate([(address, group)], buttons, issues))
+            continue
+        outputs = set(info["outputs"])
+        if _responds(devices[address]):
+            outputs.add((address, group))
+        groups.setdefault(frozenset(outputs), []).append((address, group))
+    for members in groups.values():
+        combined = _candidate(members, buttons, [])
+        if combined is not None:
+            candidates.append(combined)
+            continue
+        candidates.extend(_candidate([member], buttons, []) for member in members)
+    return sorted(
+        candidates,
+        key=lambda item: [(c["address"], c["group"]) for c in item["controllers"]],
+    )

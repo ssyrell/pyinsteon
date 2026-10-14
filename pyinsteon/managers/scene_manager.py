@@ -316,7 +316,46 @@ async def async_add_or_update_scene(
         )
 
 
-async def _async_add_or_update_scene(scene_num, links, name, work_dir, controllers):
+async def async_find_device_scenes(work_dir=None):
+    """Return hand-made device-controlled scenes which can be imported."""
+    async with _scene_lock:
+        if work_dir:
+            await controller_manager.async_load(work_dir)
+        return controller_manager.find_device_scenes()
+
+
+async def async_import_device_scene(controllers, name: str, work_dir: str):
+    """Import a hand-made device scene, adopting its existing links."""
+    async with _scene_lock:
+        await controller_manager.async_load(work_dir)
+        try:
+            wanted = sorted(
+                (Address(item["address"]).id, item["group"]) for item in controllers
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SceneControllerError(f"Invalid scene controllers: {exc}") from exc
+        for candidate in controller_manager.find_device_scenes():
+            found = [(c["address"], c["group"]) for c in candidate["controllers"]]
+            if found != wanted:
+                continue
+            if not candidate["importable"]:
+                raise SceneControllerError("; ".join(candidate["issues"]))
+            return await _async_add_or_update_scene(
+                -1,
+                candidate["links"],
+                name,
+                work_dir,
+                candidate["controllers"],
+                adopt=True,
+            )
+        raise SceneControllerError(
+            "The device scene was not found; refresh the list and try again"
+        )
+
+
+async def _async_add_or_update_scene(
+    scene_num, links, name, work_dir, controllers, *, adopt=False
+):
     if scene_num > 255:
         raise SceneControllerError("Scene groups must be between 1 and 255")
     try:
@@ -347,11 +386,7 @@ async def _async_add_or_update_scene(scene_num, links, name, work_dir, controlle
             ):
                 raise SceneControllerError(f"Invalid scene responder {link['address']}")
             responder = devices[link["address"]]
-            if (
-                responder.groups
-                and link["data3"] not in responder.groups
-                and not (len(responder.groups) == 1 and link["data3"] == 0)
-            ):
+            if not controller_manager.valid_output(responder, link["data3"]):
                 raise SceneControllerError(
                     f"Invalid responder output {link['data3']} for {responder.address}"
                 )
@@ -366,6 +401,7 @@ async def _async_add_or_update_scene(scene_num, links, name, work_dir, controlle
             _scene_links(curr_scene),
             work_dir,
             saved_name,
+            adopt=adopt,
         )
         if result == ResponseStatus.SUCCESS:
             set_scene_name(scene_num, saved_name)

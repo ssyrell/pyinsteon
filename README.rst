@@ -65,17 +65,28 @@ Existing modem-only scenes are unchanged and are not automatically paired with
 hardware scenes created by other applications.
 
 Read complete All-Link Databases before editing. Unmanaged controller groups
-with existing device links are rejected rather than overwritten. Battery
+with existing device links are rejected rather than overwritten; import them
+instead (see below). Battery
 controllers must be awake; saves do not report queued writes as successful.
 A failed save may have changed some devices. Retrieve the scene's ``pending``
 status and retry the same scene number, or retry deletion. The journal retains
 ownership of removed controllers until all required writes succeed.
 
 Responder levels and ramp rates are synchronized across underlying groups.
-Controllers can also be responders to the modem or other controllers. A
-physical controller's own load uses its local button settings; no self-links
-or local-load configuration changes are made. Controllers whose databases
-cannot be written remotely are not supported.
+Controller buttons on wired lighting devices also respond to the modem and the
+scene's other controllers. Unless a link for the button's output is provided,
+its load uses the device's local on-level and ramp rate and keypad indicators
+turn on. A physical controller's own load uses its local button settings; no
+self-links or local-load configuration changes are made. Controllers whose
+databases cannot be written remotely are not supported.
+
+``async_find_device_scenes`` scans loaded All-Link Databases for hand-made
+device-controlled scenes. Unmanaged buttons that control the same outputs
+(including each other) with the same settings form one candidate, which lists
+its ``controllers``, responder ``links``, any blocking ``issues`` and whether it
+is ``importable``. ``async_import_device_scene(controllers, name, work_dir)``
+rescans, then saves the matching candidate under a new modem group, adopting
+its existing records instead of duplicating them.
 
 .. |Build status| image:: https://dev.azure.com/pyinsteon/pyinsteon/_apis/build/status/pyinsteon.pyinsteon?branchName=main
    :target: https://dev.azure.com/pyinsteon/pyinsteon/_build/latest?definitionId=1&branchName=main
