@@ -11,6 +11,7 @@ import pytest
 from pyinsteon import pub
 from pyinsteon.address import Address
 from pyinsteon.aldb.aldb_record import ALDBRecord
+from pyinsteon.config import ON_LEVEL, RAMP_RATE
 from pyinsteon.constants import ALDBStatus, ResponseStatus
 from pyinsteon.device_types.dimmable_lighting_control import (
     DimmableLightingControl_KeypadLinc_6,
@@ -470,3 +471,50 @@ async def test_default_name_uses_allocated_modem_group(scene_devices, tmp_path):
     assert (await scenes.async_get_scene(20, str(tmp_path)))[
         "name"
     ] == "Insteon Scene 20"
+
+
+@async_case
+async def test_controllers_respond_to_the_scene(scene_devices, tmp_path):
+    """Home Assistant and other controllers drive each controller button."""
+    devices = scene_devices()
+    devices[LIGHT].properties[ON_LEVEL].set_value(64)
+    devices[LIGHT].properties[RAMP_RATE].set_value(20)
+    selected = [
+        {"address": LIGHT, "group": 1},
+        {"address": KEYPAD, "group": 3},
+        {"address": REMOTE, "group": 1},
+    ]
+    await scenes.async_add_or_update_scene(20, [], "Evening", str(tmp_path), selected)
+
+    for source, group in ((MODEM, 20), (KEYPAD, 3), (REMOTE, 1)):
+        records = active(
+            devices[LIGHT], target=source, group=group, is_controller=False
+        )
+        assert [(rec.data1, rec.data2, rec.data3) for rec in records] == [(64, 20, 1)]
+    for source, group in ((MODEM, 20), (LIGHT, 1), (REMOTE, 1)):
+        records = active(
+            devices[KEYPAD], target=source, group=group, is_controller=False
+        )
+        assert [(rec.data1, rec.data2, rec.data3) for rec in records] == [(255, 28, 3)]
+    assert not active(devices[LIGHT], target=LIGHT)
+    assert not active(devices[KEYPAD], target=KEYPAD, is_controller=False)
+    assert not active(devices[REMOTE], is_controller=False, group=20)
+    scene = await scenes.async_get_scene(20, str(tmp_path))
+    assert set(scene["devices"]) == {Address(LIGHT), Address(KEYPAD)}
+
+    assert await scenes.async_delete_scene(20, str(tmp_path)) == ResponseStatus.SUCCESS
+    for device in (devices[LIGHT], devices[KEYPAD]):
+        assert not active(device, is_controller=False, group=20)
+
+
+@async_case
+async def test_explicit_settings_override_controller_defaults(scene_devices, tmp_path):
+    """A configured level for a controller button replaces its local settings."""
+    devices = scene_devices()
+    devices[LIGHT].properties[ON_LEVEL].set_value(64)
+    links = [{"address": LIGHT, "data1": 100, "data2": 10, "data3": 1}]
+    await scenes.async_add_or_update_scene(
+        20, links, "Evening", str(tmp_path), [{"address": LIGHT, "group": 1}]
+    )
+    records = active(devices[LIGHT], target=MODEM, group=20, is_controller=False)
+    assert [(rec.data1, rec.data2, rec.data3) for rec in records] == [(100, 10, 1)]

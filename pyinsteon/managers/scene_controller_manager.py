@@ -12,9 +12,17 @@ import voluptuous as vol
 from .. import devices
 from ..address import Address
 from ..aldb.no_aldb import NoALDB
-from ..constants import ResponseStatus
+from ..config import ON_LEVEL, RAMP_RATE
+from ..constants import DeviceCategory, ResponseStatus
 
 SCENE_CONTROLLERS_FILE = "insteon_scene_controllers.json"
+# Lighting devices whose buttons respond to scenes (loads or keypad indicators).
+RESPONDING_CONTROLLER_CATEGORIES = {
+    DeviceCategory.DIMMABLE_LIGHTING_CONTROL,
+    DeviceCategory.SWITCHED_LIGHTING_CONTROL,
+}
+DEFAULT_ON_LEVEL = 255
+DEFAULT_RAMP_RATE = 28
 ControllerSchema = vol.Schema(
     [
         {
@@ -159,11 +167,47 @@ def _record(address, controller, group, target, data1, data2, data3):
     }
 
 
+def _local_setting(device, name, default):
+    prop = device.properties.get(name)
+    if prop is None or not prop.is_loaded or prop.value is None:
+        return default
+    return int(prop.value)
+
+
+def _controller_link(controller):
+    """Return the responder link that keeps a controller button in the scene."""
+    device = _device(controller["address"])
+    if device.is_battery or device.cat not in RESPONDING_CONTROLLER_CATEGORIES:
+        return None
+    on_level, ramp_rate = DEFAULT_ON_LEVEL, DEFAULT_RAMP_RATE
+    if controller["group"] == 1:
+        # Match a button press, which uses the load's local settings.
+        on_level = _local_setting(device, ON_LEVEL, on_level) or DEFAULT_ON_LEVEL
+        ramp_rate = _local_setting(device, RAMP_RATE, ramp_rate)
+    return {
+        "address": device.address.id,
+        "data1": on_level,
+        "data2": ramp_rate,
+        "data3": controller["group"],
+    }
+
+
+def _scene_links(links, controllers):
+    """Add controller buttons as responders unless explicitly configured."""
+    explicit = {(Address(link["address"]).id, link["data3"]) for link in links}
+    implied = []
+    for controller in controllers:
+        link = _controller_link(controller)
+        if link and (link["address"], link["data3"]) not in explicit:
+            implied.append(link)
+    return [*links, *implied]
+
+
 def _records(scene_num, links, controllers):
     records = {}
     sources = [{"address": devices.modem.address.id, "group": scene_num}, *controllers]
     for source in sources:
-        for link in links:
+        for link in _scene_links(links, controllers):
             responder = _device(link["address"])
             if responder.address == Address(source["address"]):
                 # A physical button controls its own load using its local settings.
