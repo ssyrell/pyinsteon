@@ -613,6 +613,57 @@ async def test_import_hand_made_scene(scene_devices, tmp_path):
 
 
 @async_case
+async def test_import_reads_set_button_links_on_single_output_devices(
+    scene_devices, tmp_path
+):
+    """A responder link storing output 0 imports as the device's only output."""
+    devices = scene_devices()
+    await hand_link(devices, KEYPAD, 4, LIGHT, 191, 20, 0)
+
+    found = await scenes.async_find_device_scenes(str(tmp_path))
+    assert found[0]["links"] == [
+        {"address": LIGHT, "data1": 191, "data2": 20, "data3": 1}
+    ]
+    scene_num, _ = await scenes.async_import_device_scene(
+        found[0]["controllers"], "Set button", str(tmp_path)
+    )
+    scene = await scenes.async_get_scene(scene_num, str(tmp_path))
+    light = scene["devices"][devices[LIGHT].address]
+    assert [(link.data1, link.data2, link.data3) for link in light] == [(191, 20, 1)]
+    # The set-button link is adopted as-is rather than duplicated or rewritten.
+    hand_made = active(devices[LIGHT], target=KEYPAD, group=4)
+    assert [(rec.data1, rec.data2, rec.data3) for rec in hand_made] == [(191, 20, 0)]
+
+
+@async_case
+async def test_output_zero_matches_the_only_output(scene_devices, tmp_path):
+    """Scenes journaled with output 0 keep their records when saved with output 1."""
+    devices = scene_devices()
+    controller = [{"address": KEYPAD, "group": 3}]
+    link = {"address": LIGHT, "data1": 128, "data2": 28, "data3": 0}
+    scene_num, result = await scenes.async_add_or_update_scene(
+        -1, [link], "Legacy", str(tmp_path), controller
+    )
+    assert result == ResponseStatus.SUCCESS
+
+    def light_records():
+        return sorted(
+            (rec.group, str(rec.target), rec.data3)
+            for _, rec in devices[LIGHT].aldb.items()
+            if rec.is_in_use
+        )
+
+    before = light_records()
+    writes = devices[LIGHT].aldb._write_manager.async_write.await_count
+    _, result = await scenes.async_add_or_update_scene(
+        scene_num, [{**link, "data3": 1}], "Legacy", str(tmp_path), controller
+    )
+    assert result == ResponseStatus.SUCCESS
+    assert light_records() == before
+    assert devices[LIGHT].aldb._write_manager.async_write.await_count == writes
+
+
+@async_case
 async def test_import_splits_buttons_with_different_settings(scene_devices, tmp_path):
     """Buttons whose shared responders use different levels import separately."""
     devices = scene_devices()

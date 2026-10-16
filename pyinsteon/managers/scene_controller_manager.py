@@ -146,12 +146,18 @@ def _device(address):
 
 
 def _key(record):
+    output = None
+    if not record["controller"]:
+        device = devices[record["address"]]
+        output = record["data3"]
+        if device is not None:
+            output = _responder_output(device, output)
     return (
         Address(record["address"]).id,
         record["controller"],
         record["group"],
         Address(record["target"]).id,
-        None if record["controller"] else record["data3"],
+        output,
     )
 
 
@@ -327,15 +333,19 @@ def _validate_controllers(scene_num, controllers, previous, *, adopt=False):
 
 
 def _matching(device, record):
-    return list(
-        device.aldb.find(
+    output = (
+        None if record["controller"] else _responder_output(device, record["data3"])
+    )
+    return [
+        rec
+        for rec in device.aldb.find(
             group=record["group"],
             target=record["target"],
             is_controller=record["controller"],
             in_use=True,
-            data3=None if record["controller"] else record["data3"],
         )
-    )
+        if output is None or _responder_output(device, rec.data3) == output
+    ]
 
 
 def _validate_databases(owned, desired):
@@ -414,10 +424,10 @@ def _stage(owned, desired):
             device.aldb.remove(duplicate.mem_addr)
         if matches:
             rec = matches[0]
-            if (rec.data1, rec.data2, rec.data3) != (
+            if (rec.data1, rec.data2, _responder_output(device, rec.data3)) != (
                 wanted["data1"],
                 wanted["data2"],
-                wanted["data3"],
+                _responder_output(device, wanted["data3"]),
             ):
                 device.aldb.modify(
                     rec.mem_addr,
@@ -552,10 +562,20 @@ def _scan_buttons():
                 button(device.address, rec.group)["targets"].add(rec.target.id)
             else:
                 outputs = button(rec.target, rec.group)["outputs"]
-                outputs.setdefault((device.address.id, rec.data3), set()).add(
-                    (rec.data1, rec.data2)
-                )
+                outputs.setdefault(
+                    (device.address.id, _responder_output(device, rec.data3)), set()
+                ).add((rec.data1, rec.data2))
     return buttons
+
+
+def _responder_output(device, data3):
+    """Return the output a responder link selects.
+
+    Links made by pressing set buttons often store 0 on single-output devices.
+    """
+    if data3 == 0 and len(device.groups) == 1:
+        return next(iter(device.groups))
+    return data3
 
 
 def _button_issues(address, group, info):
