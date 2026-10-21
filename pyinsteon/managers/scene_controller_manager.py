@@ -424,7 +424,13 @@ def _stage(owned, desired):
             device.aldb.remove(duplicate.mem_addr)
         if matches:
             rec = matches[0]
-            if (rec.data1, rec.data2, _responder_output(device, rec.data3)) != (
+            # Controller data bytes are informational; rewriting them would only
+            # cost writes, such as waking a remote whose links already exist.
+            if not wanted["controller"] and (
+                rec.data1,
+                rec.data2,
+                _responder_output(device, rec.data3),
+            ) != (
                 wanted["data1"],
                 wanted["data2"],
                 _responder_output(device, wanted["data3"]),
@@ -578,7 +584,7 @@ def _responder_output(device, data3):
     return data3
 
 
-def _button_issues(address, group, info):
+def _button_issues(address, group, info, *, conflicts=True):
     device = devices[address]
     if device is None:
         return [f"{Address(address)} is not a known Insteon device"]
@@ -590,10 +596,11 @@ def _button_issues(address, group, info):
     responders = {output[0] for output in info["outputs"]}
     for target in sorted(info["targets"] - responders):
         responder = devices[target]
-        if responder is None or not responder.aldb.is_loaded:
+        # Links to unknown devices, such as a replaced modem, are left unchanged.
+        if responder is not None and not responder.aldb.is_loaded:
             issues.append(f"Read the complete All-Link Database for {Address(target)}")
     for (target, data3), levels in sorted(info["outputs"].items()):
-        if len(levels) > 1:
+        if conflicts and len(levels) > 1:
             issues.append(f"{Address(target)} has conflicting links to this button")
         if not valid_output(devices[target], data3):
             issues.append(f"{Address(target)} has no output {data3}")
@@ -629,19 +636,110 @@ def _candidate(members, buttons, issues):
     }
 
 
+def _linked_scene(members, buttons):
+    """Return a candidate for buttons that turn each other on, if consistent.
+
+    Remotes commonly light the keypad button of the same scene and turn off the
+    keypad's load and other buttons. Those links are part of the scene; every
+    other responder must be set identically by every button.
+    """
+    owners = {address for address, _ in members}
+    responders = [pair for pair in members if _responds(devices[pair[0]])]
+    for responder in responders:
+        for member in members:
+            levels = buttons[member]["outputs"].get(responder, ())
+            if member[0] != responder[0] and not any(data1 for data1, _ in levels):
+                return None
+    external = {
+        frozenset(o for o in buttons[member]["outputs"] if o[0] not in owners)
+        for member in members
+    }
+    if len(external) != 1:
+        return None
+    links = []
+    issues = []
+    outputs = {o for member in members for o in buttons[member]["outputs"]}
+    for address, data3 in sorted(outputs):
+        shared = None
+        for member in members:
+            levels = buttons[member]["outputs"].get((address, data3))
+            if levels is not None:
+                shared = set(levels) if shared is None else shared & levels
+        if not shared:
+            return None
+        if len(shared) > 1:
+            issues.append(f"{Address(address)} has conflicting links to this button")
+        # A duplicate link that the other buttons agree on imports at their level.
+        data1, data2 = sorted(shared)[0]
+        links.append(
+            {"address": address, "data1": data1, "data2": data2, "data3": data3}
+        )
+    for member in members:
+        issues.extend(_button_issues(*member, buttons[member], conflicts=False))
+    issues = list(dict.fromkeys(issues))
+    return {
+        "controllers": [
+            {"address": address, "group": group} for address, group in sorted(members)
+        ],
+        "links": links,
+        "issues": issues,
+        "importable": not issues,
+    }
+
+
+def _linked_candidates(buttons):
+    """Return candidates for buttons that turn on another lighting button."""
+    parent = {pair: pair for pair in buttons}
+
+    def root(pair):
+        while parent[pair] != pair:
+            parent[pair] = parent[parent[pair]]
+            pair = parent[pair]
+        return pair
+
+    known = {pair for pair in buttons if devices[pair[0]] is not None}
+    for pair in known:
+        for output, levels in buttons[pair]["outputs"].items():
+            if (
+                output in known
+                and _responds(devices[output[0]])
+                and any(data1 for data1, _ in levels)
+            ):
+                parent[root(output)] = root(pair)
+    components = {}
+    for pair in sorted(buttons):
+        components.setdefault(root(pair), []).append(pair)
+    candidates = []
+    for members in components.values():
+        if len(members) > 1:
+            candidate = _linked_scene(members, buttons)
+            if candidate is not None:
+                candidates.append(candidate)
+    return candidates
+
+
 def find_device_scenes():
     """Return hand-made device-controlled scenes which can be imported.
 
-    Buttons are grouped when they control the same set of outputs (including each
-    other) with the same settings, as created by Insteon Director.
+    Buttons that turn on another lighting button, such as remotes lighting a
+    keypad button, form one scene when they set every other responder the same.
+    Other buttons are grouped when they control the same set of outputs
+    (including each other) with the same settings, as created by Insteon Director.
     """
     managed = _managed_pairs()
     buttons = {
         pair: info for pair, info in _scan_buttons().items() if pair not in managed
     }
-    candidates = []
+    candidates = _linked_candidates(buttons)
+    linked = {
+        (item["address"], item["group"])
+        for candidate in candidates
+        for item in candidate["controllers"]
+    }
     groups = {}
     for (address, group), info in sorted(buttons.items()):
+        if (address, group) in linked:
+            continue
         issues = _button_issues(address, group, info)
         if issues:
             candidates.append(_candidate([(address, group)], buttons, issues))

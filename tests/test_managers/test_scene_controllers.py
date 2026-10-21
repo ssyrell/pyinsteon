@@ -33,6 +33,8 @@ KEYPAD = "222222"
 REMOTE = "333333"
 LIGHT = "444444"
 OTHER = "555555"
+REMOTE_2 = "666666"
+OLD_MODEM = "777777"
 LINKS = [{"address": LIGHT, "data1": 128, "data2": 28, "data3": 1}]
 CONTROLLERS = [{"address": KEYPAD, "group": 3}, {"address": REMOTE, "group": 1}]
 
@@ -58,6 +60,7 @@ def scene_devices(monkeypatch):
             GeneralController_MiniRemote_8(REMOTE, 0, 0x1B),
             DimmableLightingControl_SwitchLinc01(LIGHT, 1, 1),
             DimmableLightingControl_KeypadLinc_6(OTHER, 1, 9),
+            GeneralController_MiniRemote_8(REMOTE_2, 0, 0x1B),
         ):
             devices._devices[device.address] = device
         for address in devices:
@@ -531,8 +534,12 @@ async def hand_link(devices, controller, group, responder, data1, data2, data3):
         data2=data2,
         data3=data3,
     )
-    await devices[controller].aldb.async_write()
-    await devices[responder].aldb.async_write()
+    for address in (controller, responder):
+        # Battery writes otherwise stay queued until the device wakes.
+        if devices[address].is_battery:
+            await devices[address].aldb.async_write_on_wake()
+        else:
+            await devices[address].aldb.async_write()
 
 
 def duplicate_record(device, record, data1):
@@ -701,3 +708,109 @@ async def test_blocked_device_scene_is_reported_not_imported(scene_devices, tmp_
             [{"address": KEYPAD, "group": 5}], "Blocked", str(tmp_path)
         )
     assert not active(devices[LIGHT], target=MODEM)
+
+
+async def keypad_and_remotes(devices):
+    """Link keypad buttons and remotes as hand-made scenes for the same lights.
+
+    Each remote button also lights its keypad button and turns off the keypad's
+    load and other scene buttons, as they are commonly linked.
+    """
+    scenes_by_button = {3: (1, 200), 5: (2, 0), 6: (3, 255)}
+    for group, (remote_group, level) in scenes_by_button.items():
+        for controller, controller_group in (
+            (KEYPAD, group),
+            (REMOTE, remote_group),
+            (REMOTE_2, remote_group),
+        ):
+            await hand_link(devices, controller, controller_group, LIGHT, level, 27, 1)
+            await hand_link(devices, controller, controller_group, OTHER, level, 27, 1)
+        for remote in (REMOTE, REMOTE_2):
+            await hand_link(devices, remote, remote_group, KEYPAD, 0, 27, 1)
+            for button in scenes_by_button:
+                on_level = 255 if button == group else 0
+                await hand_link(
+                    devices, remote, remote_group, KEYPAD, on_level, 28, button
+                )
+
+
+@async_case
+async def test_remotes_lighting_a_keypad_button_join_its_scene(scene_devices, tmp_path):
+    """Keypad buttons and the remote buttons lighting them are one scene each."""
+    devices = scene_devices()
+    await keypad_and_remotes(devices)
+
+    found = await scenes.async_find_device_scenes(str(tmp_path))
+    assert [item["controllers"] for item in found] == [
+        [
+            {"address": KEYPAD, "group": group},
+            {"address": REMOTE, "group": remote_group},
+            {"address": REMOTE_2, "group": remote_group},
+        ]
+        for group, remote_group in ((3, 1), (5, 2), (6, 3))
+    ]
+    assert all(item["importable"] for item in found)
+    # Each scene keeps its own levels for the shared lights.
+    assert found[0]["links"] == [
+        {"address": KEYPAD, "data1": 0, "data2": 27, "data3": 1},
+        {"address": KEYPAD, "data1": 255, "data2": 28, "data3": 3},
+        {"address": KEYPAD, "data1": 0, "data2": 28, "data3": 5},
+        {"address": KEYPAD, "data1": 0, "data2": 28, "data3": 6},
+        {"address": LIGHT, "data1": 200, "data2": 27, "data3": 1},
+        {"address": OTHER, "data1": 200, "data2": 27, "data3": 1},
+    ]
+    assert [link["data1"] for link in found[2]["links"][-2:]] == [255, 255]
+
+
+@async_case
+async def test_linked_buttons_with_different_levels_stay_separate(
+    scene_devices, tmp_path
+):
+    """A remote lighting a keypad button but setting other levels is not merged."""
+    devices = scene_devices()
+    await hand_link(devices, KEYPAD, 3, LIGHT, 200, 27, 1)
+    await hand_link(devices, REMOTE, 1, LIGHT, 100, 27, 1)
+    await hand_link(devices, REMOTE, 1, KEYPAD, 255, 28, 3)
+
+    found = await scenes.async_find_device_scenes(str(tmp_path))
+    assert [item["controllers"] for item in found] == [
+        [{"address": KEYPAD, "group": 3}],
+        [{"address": REMOTE, "group": 1}],
+    ]
+
+
+@async_case
+async def test_linked_scene_import_resolves_duplicates_without_waking_remotes(
+    scene_devices, tmp_path
+):
+    """A duplicate the other buttons agree on, and stale links, do not block import."""
+    devices = scene_devices()
+    await keypad_and_remotes(devices)
+    for remote in (REMOTE, REMOTE_2):
+        devices[remote].aldb.add(group=1, target=OLD_MODEM, controller=True)
+        await devices[remote].aldb.async_write_on_wake()
+    light_link = active(devices[LIGHT], target=KEYPAD, group=3)[0]
+    duplicate_record(devices[LIGHT], light_link, 51)
+    for remote in (REMOTE, REMOTE_2):
+        devices[remote].async_keep_awake.reset_mock()
+        devices[remote].aldb._write_manager.async_write.reset_mock()
+
+    found = await scenes.async_find_device_scenes(str(tmp_path))
+    assert found[0]["issues"] == []
+    assert {"address": LIGHT, "data1": 200, "data2": 27, "data3": 1} in found[0][
+        "links"
+    ]
+    scene_num, result = await scenes.async_import_device_scene(
+        found[0]["controllers"], "Evening", str(tmp_path)
+    )
+    assert result == ResponseStatus.SUCCESS
+
+    records = active(devices[LIGHT], target=KEYPAD, group=3)
+    assert [(rec.data1, rec.data2) for rec in records] == [(200, 27)]
+    for remote in (REMOTE, REMOTE_2):
+        assert not devices[remote].async_keep_awake.called
+        assert not devices[remote].aldb._write_manager.async_write.called
+        assert active(devices[remote], target=OLD_MODEM, group=1)
+        light = active(devices[LIGHT], target=remote, group=1)
+        assert [(rec.data1, rec.data2) for rec in light] == [(200, 27)]
+    assert len(active(devices[LIGHT], target=MODEM, group=scene_num)) == 1

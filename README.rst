@@ -82,7 +82,10 @@ databases cannot be written remotely are not supported.
 
 ``async_find_device_scenes`` scans loaded All-Link Databases for hand-made
 device-controlled scenes. Unmanaged buttons that control the same outputs
-(including each other) with the same settings form one candidate, which lists
+(including each other) with the same settings form one candidate. Buttons that
+turn on another lighting button, such as remotes lighting a keypad button and
+turning off its load and other buttons, join that button's candidate when they
+set every other responder identically. Each candidate lists
 its ``controllers``, responder ``links``, any blocking ``issues`` and whether it
 is ``importable``. ``async_import_device_scene(controllers, name, work_dir)``
 rescans, then saves the matching candidate under a new modem group, adopting
