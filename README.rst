@@ -91,6 +91,23 @@ is ``importable``. ``async_import_device_scene(controllers, name, work_dir)``
 rescans, then saves the matching candidate under a new modem group, adopting
 its existing records instead of duplicating them.
 
+Scene states
+------------
+
+``async_load_scene_states(work_dir)`` returns ``scene_states``, the on/off
+state of every scene in the scene list. Each ``InsteonScene`` has a
+``scene_num``, ``name``, ``controllers`` and ``is_on`` (``None`` until known),
+``async_on``/``async_off`` methods and ``subscribe(callback)``, which returns a
+function that stops the callbacks. ``scene_states.subscribe(callback)`` reports
+``"added"`` and ``"removed"`` scenes as they are saved, imported and deleted.
+Scenes missing from the list are only removed when they are deleted.
+
+Triggering a scene through the modem sets its state. Scenes with controllers
+also follow every controller button press, and controllers that report their
+state, such as keypad buttons, keep it in step (``has_device_state``). Battery
+remotes only report presses. ``restore_state`` sets a saved state while the
+state is still unknown.
+
 .. |Build status| image:: https://dev.azure.com/pyinsteon/pyinsteon/_apis/build/status/pyinsteon.pyinsteon?branchName=main
    :target: https://dev.azure.com/pyinsteon/pyinsteon/_build/latest?definitionId=1&branchName=main
 .. |GitHub release| image:: https://img.shields.io/github/release/pyinsteon/pyinsteon.svg

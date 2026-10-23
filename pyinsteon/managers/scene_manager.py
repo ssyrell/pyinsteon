@@ -18,6 +18,7 @@ from ..handlers.send_all_link_on import SendAllLinkOnCommandHandler
 from ..utils import multiple_status
 from .device_link_manager import LinkInfo
 from .scene_controller_manager import SceneControllerError
+from .scene_state_manager import SceneStateManager
 
 SCENE_FILE = "insteon_scenes.json"
 _LOGGER = logging.getLogger(__name__)
@@ -58,6 +59,7 @@ async def _get_scene_device_status(group: int):
 async def async_trigger_scene_on(group):
     """Trigger an Insteon scene ON."""
     await SendAllLinkOnCommandHandler().async_send(group=group)
+    _set_scene_state(group, True)
     await asyncio.sleep(2)
     await _get_scene_device_status(group)
 
@@ -65,8 +67,37 @@ async def async_trigger_scene_on(group):
 async def async_trigger_scene_off(group):
     """Trigger an Insteon scene OFF."""
     await SendAllLinkOffCommandHandler().async_send(group=group)
+    _set_scene_state(group, False)
     await asyncio.sleep(2)
     await _get_scene_device_status(group)
+
+
+async def _async_trigger_scene(group, is_on):
+    if is_on:
+        await async_trigger_scene_on(group)
+    else:
+        await async_trigger_scene_off(group)
+
+
+scene_states = SceneStateManager(_async_trigger_scene)
+
+
+def _set_scene_state(group, is_on):
+    scene = scene_states.get(group)
+    if scene:
+        scene.set_state(is_on)
+
+
+async def async_load_scene_states(work_dir=None) -> SceneStateManager:
+    """Load the on/off states of the scenes in the scene list."""
+    async with _scene_lock:
+        scene_states.update(await async_get_scenes(work_dir))
+    return scene_states
+
+
+async def _async_refresh_scene_states(deleted=None):
+    if scene_states.loaded:
+        scene_states.update(await async_get_scenes(), deleted=deleted)
 
 
 async def async_get_scenes(work_dir=None):
@@ -311,9 +342,11 @@ async def async_add_or_update_scene(
 ) -> int:
     """Create or update a scene with a list of devices and device link data."""
     async with _scene_lock:
-        return await _async_add_or_update_scene(
+        result = await _async_add_or_update_scene(
             scene_num, links, name, work_dir, controllers
         )
+        await _async_refresh_scene_states()
+        return result
 
 
 async def async_find_device_scenes(work_dir=None):
@@ -340,7 +373,7 @@ async def async_import_device_scene(controllers, name: str, work_dir: str):
                 continue
             if not candidate["importable"]:
                 raise SceneControllerError("; ".join(candidate["issues"]))
-            return await _async_add_or_update_scene(
+            result = await _async_add_or_update_scene(
                 -1,
                 candidate["links"],
                 name,
@@ -348,6 +381,8 @@ async def async_import_device_scene(controllers, name: str, work_dir: str):
                 candidate["controllers"],
                 adopt=True,
             )
+            await _async_refresh_scene_states()
+            return result
         raise SceneControllerError(
             "The device scene was not found; refresh the list and try again"
         )
@@ -446,7 +481,9 @@ async def _async_add_or_update_scene(
 async def async_delete_scene(scene_num: int, work_dir: Union[str, None]):
     """Delete a scene."""
     async with _scene_lock:
-        return await _async_delete_scene(scene_num, work_dir)
+        result = await _async_delete_scene(scene_num, work_dir)
+        await _async_refresh_scene_states(deleted=scene_num)
+        return result
 
 
 async def _async_delete_scene(scene_num, work_dir):
