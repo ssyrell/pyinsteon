@@ -1,5 +1,6 @@
 """Test the on/off state of Insteon scenes."""
 
+import gc
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -51,7 +52,10 @@ def state_devices(request, monkeypatch):
         monkeypatch.setattr(scene_state_manager, "devices", devices)
         return devices, sent
 
-    return build
+    yield build
+    # Free the scenes' listeners while this test's publisher is still in use.
+    # Otherwise a later collection can free them while another test publishes.
+    gc.collect()
 
 
 async def _save(tmp_path, controllers=None, scene_num=-1, name="Evening"):
