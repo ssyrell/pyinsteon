@@ -83,6 +83,10 @@ def scene_devices(monkeypatch):
             aldb._write_manager.async_write = AsyncMock(
                 return_value=ResponseStatus.SUCCESS
             )
+            # Keypad buttons have been read and do not set other buttons.
+            for name, prop in devices[address].properties.items():
+                if name.startswith(("on_mask", "off_mask")):
+                    prop.set_value(0)
         monkeypatch.setattr(controllers, "devices", devices)
         monkeypatch.setattr(scenes, "devices", devices)
         return devices
@@ -814,3 +818,92 @@ async def test_linked_scene_import_resolves_duplicates_without_waking_remotes(
         light = active(devices[LIGHT], target=remote, group=1)
         assert [(rec.data1, rec.data2) for rec in light] == [(200, 27)]
     assert len(active(devices[LIGHT], target=MODEM, group=scene_num)) == 1
+
+
+def keypad_button_settings(device, group, on_buttons, off_buttons, on_level, ramp_rate):
+    """Set the buttons a keypad button turns on and off, and its load level."""
+    suffix = "" if group == 1 else f"_{group}"
+    device.properties[f"on_mask{suffix}"].set_value(
+        sum(1 << (button - 1) for button in on_buttons)
+    )
+    device.properties[f"off_mask{suffix}"].set_value(
+        sum(1 << (button - 1) for button in off_buttons)
+    )
+    device.properties[f"on_level{suffix}"].set_value(on_level)
+    device.properties[f"ramp_rate{suffix}"].set_value(ramp_rate)
+
+
+@async_case
+async def test_keypad_scene_imports_the_keypads_own_buttons(scene_devices, tmp_path):
+    """A keypad button's load level and button settings import with its scene."""
+    devices = scene_devices()
+    keypad = devices[KEYPAD]
+    # Button A turns the load off over 2 seconds and buttons C and D off.
+    keypad_button_settings(keypad, 3, (1, 3), (1, 5, 6), 0, 27)
+    await hand_link(devices, KEYPAD, 3, LIGHT, 200, 28, 1)
+
+    found = await scenes.async_find_device_scenes(str(tmp_path))
+    assert found == [
+        {
+            "controllers": [{"address": KEYPAD, "group": 3}],
+            "links": [
+                {"address": KEYPAD, "data1": 0, "data2": 27, "data3": 1},
+                {"address": KEYPAD, "data1": 0, "data2": 28, "data3": 5},
+                {"address": KEYPAD, "data1": 0, "data2": 28, "data3": 6},
+                {"address": LIGHT, "data1": 200, "data2": 28, "data3": 1},
+            ],
+            "issues": [],
+            "importable": True,
+        }
+    ]
+    scene_num, result = await scenes.async_import_device_scene(
+        found[0]["controllers"], "Evening", str(tmp_path)
+    )
+    assert result == ResponseStatus.SUCCESS
+
+    # The modem scene sets the keypad as a press of button A does.
+    records = {
+        rec.data3: (rec.data1, rec.data2)
+        for rec in active(keypad, target=MODEM, group=scene_num, is_controller=False)
+    }
+    assert records == {1: (0, 27), 3: (255, 28), 5: (0, 28), 6: (0, 28)}
+    # The keypad applies its own settings when button A is pressed.
+    assert active(keypad, target=KEYPAD) == []
+    scene = await scenes.async_get_scene(scene_num, str(tmp_path))
+    assert sorted(
+        (link.data3, link.data1, link.data2)
+        for link in scene["devices"][Address(KEYPAD)]
+    ) == [(1, 0, 27), (3, 255, 28), (5, 0, 28), (6, 0, 28)]
+
+
+@async_case
+async def test_keypad_load_follows_a_button_at_its_level(scene_devices, tmp_path):
+    """A button that turns the load on imports the button's level and ramp rate."""
+    devices = scene_devices()
+    keypad_button_settings(devices[KEYPAD], 6, (1, 6), (3, 5), 255, 27)
+    await hand_link(devices, KEYPAD, 6, LIGHT, 255, 28, 1)
+    # The main button controls the same light, but is not part of button D's scene.
+    await hand_link(devices, KEYPAD, 1, LIGHT, 255, 28, 1)
+
+    found = await scenes.async_find_device_scenes(str(tmp_path))
+    assert [item["controllers"] for item in found] == [
+        [{"address": KEYPAD, "group": 1}],
+        [{"address": KEYPAD, "group": 6}],
+    ]
+    assert found[1]["links"][:3] == [
+        {"address": KEYPAD, "data1": 255, "data2": 27, "data3": 1},
+        {"address": KEYPAD, "data1": 0, "data2": 28, "data3": 3},
+        {"address": KEYPAD, "data1": 0, "data2": 28, "data3": 5},
+    ]
+
+
+@async_case
+async def test_unread_keypad_buttons_block_import(scene_devices, tmp_path):
+    """A keypad whose button settings have not been read is not imported."""
+    devices = scene_devices()
+    devices[KEYPAD].properties["on_mask_3"]._is_loaded = False
+    await hand_link(devices, KEYPAD, 3, LIGHT, 200, 28, 1)
+
+    found = await scenes.async_find_device_scenes(str(tmp_path))
+    assert found[0]["issues"] == [f"Read the properties of {Address(KEYPAD)}"]
+    assert not found[0]["importable"]

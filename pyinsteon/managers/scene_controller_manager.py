@@ -13,7 +13,9 @@ from .. import devices
 from ..address import Address
 from ..aldb.no_aldb import NoALDB
 from ..config import ON_LEVEL, RAMP_RATE
+from ..config.radio_button import off_mask_name, on_mask_name
 from ..constants import DeviceCategory, ResponseStatus
+from ..utils import bit_is_set
 
 SCENE_CONTROLLERS_FILE = "insteon_scene_controllers.json"
 # Lighting devices whose buttons respond to scenes (loads or keypad indicators).
@@ -571,7 +573,55 @@ def _scan_buttons():
                 outputs.setdefault(
                     (device.address.id, _responder_output(device, rec.data3)), set()
                 ).add((rec.data1, rec.data2))
+    for (address, group), info in buttons.items():
+        device = devices[address]
+        for output, level in _keypad_outputs(device, group).items():
+            info["outputs"].setdefault(output, set()).add(level)
     return buttons
+
+
+def _mask_properties(device, group):
+    """Return a keypad button's on and off mask properties, if it has them."""
+    if device is None:
+        return None
+    on_mask = device.properties.get(on_mask_name(group))
+    off_mask = device.properties.get(off_mask_name(group))
+    if on_mask is None or off_mask is None:
+        return None
+    return on_mask, off_mask
+
+
+def _keypad_outputs(device, group):
+    """Return the keypad's own outputs that a button press sets.
+
+    A keypad button turns off the buttons in its off mask. The load follows the
+    button at the button's on-level and ramp rate when it is in the on mask, and
+    other buttons in the on mask turn on. These settings are kept in the keypad
+    rather than its All-Link Database.
+    """
+    masks = _mask_properties(device, group)
+    if masks is None or not all(mask.is_loaded for mask in masks):
+        return {}
+    on_mask, off_mask = (int(mask.value or 0) for mask in masks)
+    suffix = "" if group == 1 else f"_{group}"
+    on_level = _local_setting(device, f"{ON_LEVEL}{suffix}", DEFAULT_ON_LEVEL)
+    ramp_rate = _local_setting(device, f"{RAMP_RATE}{suffix}", DEFAULT_RAMP_RATE)
+    outputs = {}
+    for output in device.groups:
+        if output == group:
+            continue
+        is_on = bit_is_set(on_mask, output - 1)
+        is_off = bit_is_set(off_mask, output - 1)
+        if output == 1 and (is_on or is_off):
+            level = (on_level if is_on else 0, ramp_rate)
+        elif is_off:
+            level = (0, DEFAULT_RAMP_RATE)
+        elif is_on:
+            level = (DEFAULT_ON_LEVEL, DEFAULT_RAMP_RATE)
+        else:
+            continue
+        outputs[(device.address.id, output)] = level
+    return outputs
 
 
 def _responder_output(device, data3):
@@ -593,6 +643,9 @@ def _button_issues(address, group, info, *, conflicts=True):
         issues.append(f"{device.address} group {group} is not a controller button")
     if not device.aldb.is_loaded:
         issues.append(f"Read the complete All-Link Database for {device.address}")
+    masks = _mask_properties(device, group)
+    if masks is not None and not all(mask.is_loaded for mask in masks):
+        issues.append(f"Read the properties of {device.address}")
     responders = {output[0] for output in info["outputs"]}
     for target in sorted(info["targets"] - responders):
         responder = devices[target]
@@ -700,8 +753,10 @@ def _linked_candidates(buttons):
     known = {pair for pair in buttons if devices[pair[0]] is not None}
     for pair in known:
         for output, levels in buttons[pair]["outputs"].items():
+            # A keypad's own buttons are part of each of its scenes, not linked ones.
             if (
                 output in known
+                and output[0] != pair[0]
                 and _responds(devices[output[0]])
                 and any(data1 for data1, _ in levels)
             ):

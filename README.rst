@@ -87,7 +87,10 @@ turn on another lighting button, such as remotes lighting a keypad button and
 turning off its load and other buttons, join that button's candidate when they
 set every other responder identically. Each candidate lists
 its ``controllers``, responder ``links``, any blocking ``issues`` and whether it
-is ``importable``. ``async_import_device_scene(controllers, name, work_dir)``
+is ``importable``. A keypad button's candidate also sets the keypad's own load
+and buttons as a press does: buttons in its off mask turn off, and its on mask
+sets the load to the button's on-level and ramp rate. Read the keypad's
+properties first. ``async_import_device_scene(controllers, name, work_dir)``
 rescans, then saves the matching candidate under a new modem group, adopting
 its existing records instead of duplicating them.
 
